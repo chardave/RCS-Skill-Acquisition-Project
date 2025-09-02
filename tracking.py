@@ -72,6 +72,10 @@ for svo_path in svo_files:
     output_dir = os.path.dirname(svo_path)
     base_filename = os.path.splitext(os.path.basename(svo_path))[0]  # Remove extension
     json_files = {tag_id: os.path.join(output_dir, f"apriltag_{tag_id}.json") for tag_id in valid_tag_ids}
+
+    # --- Initialize last known positions for this SVO file ---
+    last_known_position = {tag_id: None for tag_id in valid_tag_ids}
+    last_known_transformation = {tag_id: None for tag_id in valid_tag_ids}
     
     fps = 15
     last_timestamp = None
@@ -110,13 +114,14 @@ for svo_path in svo_files:
                 curr_timestamp_ns = zed.get_timestamp(sl.TIME_REFERENCE.IMAGE).get_nanoseconds()
                 curr_timestamp = curr_timestamp_ns / 1e9
 
-                
+                # --- Determine if frame is a dropped frame ---
                 # If not the first frame, check for skip
+                is_dropped_frame = False
                 if last_timestamp is not None:
                     gap = curr_timestamp - last_timestamp
                     if gap > expected_interval_sec * 1.5:
                         log_skips.write(f"{frame_count},{gap:.6f}\n")
-                        # print(f"[SKIP] Large gap at frame {frame_count}: {gap:.3f}s. Inserting duplicate.")
+                        is_dropped_frame = True
                         # Write the last frame to maintain timing
                         if last_frame is not None:
                             out.write(last_frame)
@@ -129,6 +134,9 @@ for svo_path in svo_files:
                     detections = detector.detect(gray)
 
                 image_width, image_height = image.get_width(), image.get_height()
+
+                # Keep track of which tags were detected this frame
+                tags_detected_this_frame = set()
 
                 for det in detections:
                     tag_id = det.tag_id
@@ -164,8 +172,6 @@ for svo_path in svo_files:
                     R[:, 2] = z_axis
 
                     T = tvec.reshape((3, 1))
-                    # T[2] = tag_depth
-
                     Trans = np.hstack([R, T])
                     Trans = np.vstack((Trans, [0, 0, 0, 1]))
                     Trans_list = Trans.tolist()
@@ -184,6 +190,12 @@ for svo_path in svo_files:
                     with open(json_files[tag_id], "a") as f:
                         json.dump(tag_info, f, indent=4)
                         f.write("\n")
+                    
+                    # Update last known positions for repeats
+                    last_known_position[tag_id] = tag_info["position"]
+                    last_known_transformation[tag_id] = tag_info["transformation_matrix"]
+
+                    tags_detected_this_frame.add(tag_id)
 
                     # ------------- Draw tag border -----------------
 
@@ -201,8 +213,30 @@ for svo_path in svo_files:
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
 
                     cv2.drawFrameAxes(frame,camera_matrix,dist_coeffs, rvec, tvec, 0.04)
+                
+                # --- Handle tags not detected this frame --- 
+                for tag_id in valid_tag_ids:
+                    if tag_id not in tags_detected_this_frame:
+                        if is_dropped_frame:
+                            # for dropped frames, repeat last known position
+                            position = last_known_position[tag_id]
+                            transformation = last_known_transformation[tag_id]
+                        else: 
+                            # for real frame with missing detection, mark as None
+                            position = None
+                            transformation = None
+                        
+                        tag_info = {
+                            "tag_id": tag_id,
+                            "frame_id": frame_count,
+                            "position": position,
+                            "transformation_matrix": transformation
+                        }
 
-
+                        with open(json_files[tag_id], "a") as f:
+                            json.dump(tag_info, f, indent=4)
+                            f.write("\n")
+                            
                 cv2.imshow("AprilTag Detection", frame)
                 frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR) if frame.shape[2] == 4 else frame
                 out.write(frame_bgr)
