@@ -25,7 +25,7 @@ def progress_bar(percent_done, bar_length=50):
     sys.stdout.flush()
 
 # Directory containing subfolders with SVO2 files
-root_dir = "/media/username/DiskExFAT/RoboticsPhantom/"
+root_dir = "/media/surgicaldatascience/DiskExFAT/StarPhantom"
 
 # Find all SVO2 files
 svo_files = []
@@ -61,6 +61,9 @@ for svo_path in svo_files:
 
     num_frames = zed.get_svo_number_of_frames()
     camera_info = zed.get_camera_information()
+    svo_fps = cam_info.camera_configuration.fps
+    fps = float(svo_fps) if svo_fps else 15.0
+    expected_interval_sec = 1.0 / fps
     camera_params = camera_info.camera_configuration.calibration_parameters
 
     fx, fy = camera_params.left_cam.fx, camera_params.left_cam.fy
@@ -71,7 +74,7 @@ for svo_path in svo_files:
     # Output directory and filenames
     output_dir = os.path.dirname(svo_path)
     base_filename = os.path.splitext(os.path.basename(svo_path))[0]  # Remove extension
-    json_files = {tag_id: os.path.join(output_dir, f"apriltag_{tag_id}.json") for tag_id in valid_tag_ids}
+    json_files = {tag_id: os.path.join(output_dir, f"fixed_apriltag_{tag_id}.json") for tag_id in valid_tag_ids}
 
     # --- Initialize last known positions for this SVO file ---
     last_known_position = {tag_id: None for tag_id in valid_tag_ids}
@@ -86,7 +89,7 @@ for svo_path in svo_files:
     log_skips.write("Skipped Frame Log\nFrameIndex,TimeGap(s)\n")
 
     # Video output
-    video_output_path = os.path.join(output_dir, f"fixed_annotated_console_view.avi")
+    video_output_path = os.path.join(output_dir, f"annotated_console_view.avi")
     frame_width = zed.get_camera_information().camera_configuration.resolution.width
     frame_height = zed.get_camera_information().camera_configuration.resolution.height
     fourcc = cv2.VideoWriter_fourcc(*'XVID')
@@ -96,47 +99,60 @@ for svo_path in svo_files:
     depth = sl.Mat()
     runtime = sl.RuntimeParameters()
     frame_count = 0
+    out_frame_idx = 0            # single source-of-truth frame index for BOTH video & JSON
+    video_frames_written = 0
+
 
     try:
         while True:
             err = zed.grab(runtime)
             if err == sl.ERROR_CODE.SUCCESS:
-                frame_count += 1
-                progress_bar((frame_count / num_frames) * 100)
-
+                # --- Get frame + timestamps ---
                 zed.retrieve_image(image, sl.VIEW.LEFT)
                 zed.retrieve_measure(depth, sl.MEASURE.DEPTH)
-
                 frame = image.get_data()
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-                # Get timestamp in seconds
                 curr_timestamp_ns = zed.get_timestamp(sl.TIME_REFERENCE.IMAGE).get_nanoseconds()
-                curr_timestamp = curr_timestamp_ns / 1e9
+                curr_timestamp    = curr_timestamp_ns / 1e9
 
-                # --- Determine if frame is a dropped frame ---
-                # If not the first frame, check for skip
-                is_dropped_frame = False
-                if last_timestamp is not None:
+                # --- Fill timeline gap with duplicates BEFORE this real frame ---
+                if last_timestamp is not None and last_frame is not None:
                     gap = curr_timestamp - last_timestamp
-                    if gap > expected_interval_sec * 1.5:
-                        log_skips.write(f"{frame_count},{gap:.6f}\n")
-                        is_dropped_frame = True
-                        # Write the last frame to maintain timing
-                        if last_frame is not None:
+                    n_missing = int(math.floor(gap / expected_interval_sec)) - 1
+                    if n_missing > 0:
+                        # optional: log once per gap
+                        log_skips.write(f"{out_frame_idx+1},{gap:.6f}\n")
+                        for _ in range(n_missing):
+                            # write duplicate video
                             out.write(last_frame)
+                            video_frames_written += 1
+                            out_frame_idx += 1
 
-                # Update last timestamp
+                            # write duplicate JSON rows for all tags using last-known pose
+                            for tag_id in valid_tag_ids:
+                                tag_info_dup = {
+                                    "tag_id": tag_id,
+                                    "frame_id": out_frame_idx,
+                                    "position": last_known_position[tag_id],
+                                    "transformation_matrix": last_known_transformation[tag_id],
+                                    "dropped_fill": True
+                                }
+                                with open(json_files[tag_id], "a") as f:
+                                    json.dump(tag_info_dup, f, indent=4)
+                                    f.write("\n")
+
+                # update timestamp baseline
                 last_timestamp = curr_timestamp
 
-
+                # --- Detect AprilTags on the REAL frame ---
                 with SuppressOutput():
                     detections = detector.detect(gray)
 
                 image_width, image_height = image.get_width(), image.get_height()
 
-                # Keep track of which tags were detected this frame
-                tags_detected_this_frame = set()
+                # Build per-tag payload for this real frame first, then write once per tag
+                per_tag_this_frame = {tag: {"position": None, "transformation_matrix": None} for tag in valid_tag_ids}
 
                 for det in detections:
                     tag_id = det.tag_id
@@ -146,9 +162,9 @@ for svo_path in svo_files:
                     corners = det.corners.astype(np.float32)
                     if any(c[0] < 0 or c[1] < 0 or c[0] >= image_width or c[1] >= image_height for c in corners):
                         continue
-                    
-                    tag_size = 0.03/(2.0 ** 0.5)
-                    half_size = tag_size/2.0
+
+                    tag_size  = 0.03 / (2.0 ** 0.5)
+                    half_size = tag_size / 2.0
                     obj_points = np.array([
                         [-half_size,  half_size, 0],
                         [ half_size,  half_size, 0],
@@ -162,86 +178,57 @@ for svo_path in svo_files:
 
                     cX, cY = int(np.mean(corners, axis=0)[0]), int(np.mean(corners, axis=0)[1])
                     tag_depth = depth.get_value(cX, cY)[1]
-
-                    # skip invalid depth values
                     if not np.isfinite(tag_depth) or tag_depth <= 0:
-                        continue   
+                        continue
 
                     R, _ = cv2.Rodrigues(rvec)
                     z_axis = np.cross(R[:, 0], R[:, 1])
                     R[:, 2] = z_axis
 
-                    T = tvec.reshape((3, 1))
-                    Trans = np.hstack([R, T])
-                    Trans = np.vstack((Trans, [0, 0, 0, 1]))
-                    Trans_list = Trans.tolist()
+                    T     = tvec.reshape((3, 1))
+                    Trans = np.vstack([np.hstack([R, T]), [0, 0, 0, 1]])
+                    pos   = {"x": float(tvec[0]), "y": float(tvec[1]), "z": float(tag_depth)}
 
-                    tag_info = {
-                        "tag_id": tag_id,
-                        "frame_id": frame_count,
-                        "position": {
-                            "x": float(tvec[0]),
-                            "y": float(tvec[1]),
-                            "z": float(tag_depth)
-                        },
-                        "transformation_matrix": Trans_list
-                    }
+                    per_tag_this_frame[tag_id]["position"]               = pos
+                    per_tag_this_frame[tag_id]["transformation_matrix"]  = Trans.tolist()
 
-                    with open(json_files[tag_id], "a") as f:
-                        json.dump(tag_info, f, indent=4)
-                        f.write("\n")
-                    
-                    # Update last known positions for repeats
-                    last_known_position[tag_id] = tag_info["position"]
-                    last_known_transformation[tag_id] = tag_info["transformation_matrix"]
-
-                    tags_detected_this_frame.add(tag_id)
-
-                    # ------------- Draw tag border -----------------
-
+                    # draw overlays (unchanged)
                     for i in range(4):
                         pt1 = tuple(corners[i].astype(int))
                         pt2 = tuple(corners[(i + 1) % 4].astype(int))
                         cv2.line(frame, pt1, pt2, (0, 255, 0), 2)
-                    
-                    # ----------- Draw center and text --------------
                     cX, cY = np.mean(det.corners, axis=0).astype(int)
                     cv2.circle(frame, (cX, cY), 4, (0, 0, 255), -1)
                     cv2.putText(frame, f"ID: {det.tag_id}", (cX - 10, cY - 10),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
                     cv2.putText(frame, f"Depth: {tag_depth:.2f}m", (cX - 10, cY + 15),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
+                    cv2.drawFrameAxes(frame, camera_matrix, dist_coeffs, rvec, tvec, 0.04)
 
-                    cv2.drawFrameAxes(frame,camera_matrix,dist_coeffs, rvec, tvec, 0.04)
-                
-                # --- Handle tags not detected this frame --- 
+                # --- FINALIZE: write ONE JSON row per tag for THIS real frame ---
+                out_frame_idx += 1
                 for tag_id in valid_tag_ids:
-                    if tag_id not in tags_detected_this_frame:
-                        if is_dropped_frame:
-                            # for dropped frames, repeat last known position
-                            position = last_known_position[tag_id]
-                            transformation = last_known_transformation[tag_id]
-                        else: 
-                            # for real frame with missing detection, mark as None
-                            position = None
-                            transformation = None
-                        
-                        tag_info = {
-                            "tag_id": tag_id,
-                            "frame_id": frame_count,
-                            "position": position,
-                            "transformation_matrix": transformation
-                        }
+                    info = per_tag_this_frame[tag_id]
+                    tag_info_real = {
+                        "tag_id": tag_id,
+                        "frame_id": out_frame_idx,
+                        "position": info["position"],                         # None if not detected
+                        "transformation_matrix": info["transformation_matrix"]  # None if not detected
+                    }
+                    with open(json_files[tag_id], "a") as f:
+                        json.dump(tag_info_real, f, indent=4)
+                        f.write("\n")
 
-                        with open(json_files[tag_id], "a") as f:
-                            json.dump(tag_info, f, indent=4)
-                            f.write("\n")
-                            
-                cv2.imshow("AprilTag Detection", frame)
+                    # update last-known (so future duplicates have latest values)
+                    last_known_position[tag_id]      = info["position"] if info["position"] is not None else last_known_position[tag_id]
+                    last_known_transformation[tag_id]= info["transformation_matrix"] if info["transformation_matrix"] is not None else last_known_transformation[tag_id]
+
+                # --- write video for THIS real frame ---
                 frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR) if frame.shape[2] == 4 else frame
                 out.write(frame_bgr)
+                video_frames_written += 1
+                last_frame = frame_bgr.copy()
 
-                last_frame = frame_bgr.copy()  # Keep a copy to reuse if needed
 
             elif err == sl.ERROR_CODE.END_OF_SVOFILE_REACHED:
                 progress_bar(100, 30)
